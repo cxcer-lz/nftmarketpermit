@@ -12,9 +12,7 @@ contract NFTMarket is Ownable(msg.sender), EIP712("OpenSpaceNFTMarket", "1") {
     address public constant ETH_FLAG = address(0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE);
     uint256 public constant feeBP = 30; // 30/10000 = 0.3%
     address public whiteListSigner;
-    address public feeTo; 
-    mapping(bytes32 => SellOrder) public listingOrders; // orderId -> order book 
-    mapping(address => mapping(uint256 => bytes32)) private _lastIds; //  nft -> lastOrderId
+    address public feeTo;
 
     struct SellOrder {
         address seller;
@@ -25,134 +23,110 @@ contract NFTMarket is Ownable(msg.sender), EIP712("OpenSpaceNFTMarket", "1") {
         uint256 deadline;
     }
 
-    function listing(address nft, uint256 tokenId) external view returns (bytes32) {
-        bytes32 id = _lastIds[nft][tokenId];
-        return listingOrders[id].seller == address(0) ? bytes32(0x00) : id;
+    bytes32 constant LIST_TYPEHASH = keccak256("SellOrder(address seller,address nft,uint256 tokenId,address payToken,uint256 price,uint256 deadline)");
+    mapping(bytes32 => bool) public cancelledOrders; // Blacklist for cancelled orders
+
+    function buy(SellOrder calldata order, bytes calldata signature) public payable {
+        buy(order, signature, feeTo);
     }
 
-    function list(address nft, uint256 tokenId, address payToken, uint256 price, uint256 deadline) external {
-        require(deadline > block.timestamp, "MKT: deadline is in the past");
-        require(price > 0, "MKT: price is zero");
-        require(payToken == address(0) || IERC20(payToken).totalSupply() > 0, "MKT: payToken is not valid");
+    function buy(SellOrder calldata order, bytes calldata signature, bytes calldata signatureForWL) external payable {
+        _checkWL(signatureForWL);
+        // trade fee is zero
+        buy(order, signature, address(0));
+    }
 
-        // safe check
-        require(IERC721(nft).ownerOf(tokenId) == msg.sender, "MKT: not owner");
+    function buy(SellOrder calldata order, bytes calldata signature, address feeReceiver) private {
+        bytes32 orderId = _hashOrder(order);
+
+        // Check if the order is cancelled
+        require(!cancelledOrders[orderId], "MKT: order cancelled");
+
+        // Verify the signature
+        address signer = ECDSA.recover(_hashTypedDataV4(orderId), signature);
+        require(signer == order.seller, "MKT: invalid signature");
+
+        // Check order validity
+        require(order.deadline > block.timestamp, "MKT: order expired");
+        require(IERC721(order.nft).ownerOf(order.tokenId) == order.seller, "MKT: not owner");
         require(
-            IERC721(nft).getApproved(tokenId) == address(this)
-                || IERC721(nft).isApprovedForAll(msg.sender, address(this)),
+            IERC721(order.nft).getApproved(order.tokenId) == address(this)
+                || IERC721(order.nft).isApprovedForAll(order.seller, address(this)),
             "MKT: not approved"
         );
 
-        SellOrder memory order = SellOrder({
-            seller: msg.sender,
-            nft: nft,
-            tokenId: tokenId,
-            payToken: payToken,
-            price: price,
-            deadline: deadline
-        });
-
-        bytes32 orderId = keccak256(abi.encode(order));
-        // safe check repeat list
-        require(listingOrders[orderId].seller == address(0), "MKT: order already listed");
-        listingOrders[orderId] = order;
-        _lastIds[nft][tokenId] = orderId; // reset
-        emit List(nft, tokenId, orderId, msg.sender, payToken, price, deadline);
-    }
-
-    function cancel(bytes32 orderId) external {
-        address seller = listingOrders[orderId].seller;
-        // safe check repeat list
-        require(seller != address(0), "MKT: order not listed");
-        require(seller == msg.sender, "MKT: only seller can cancel");
-        delete listingOrders[orderId];
-        emit Cancel(orderId);
-    }
-
-    function buy(bytes32 orderId) public payable {
-        _buy(orderId, feeTo);
-    }
-
-    function buy(bytes32 orderId, bytes calldata signatureForWL) external payable {
-        _checkWL(signatureForWL);
-        // trade fee is zero
-        _buy(orderId, address(0));
-    }
-
-    function _buy(bytes32 orderId, address feeReceiver) private {
-        // 0. load order info to memory for check and read
-        SellOrder memory order = listingOrders[orderId];
-
-        // 1. check
-        require(order.seller != address(0), "MKT: order not listed");
-        require(order.deadline > block.timestamp, "MKT: order expired");
-
-        // 2. remove order info before transfer
-        delete listingOrders[orderId];
-        // 3. trasnfer NFT
+        // Transfer NFT
         IERC721(order.nft).safeTransferFrom(order.seller, msg.sender, order.tokenId);
 
-        // 4. trasnfer token
-        // fee 0.3% or 0
+        // Transfer payment
         uint256 fee = feeReceiver == address(0) ? 0 : order.price * feeBP / 10000;
-        // safe check
         if (order.payToken == ETH_FLAG) {
             require(msg.value == order.price, "MKT: wrong eth value");
+            _transferETH(order.seller, order.price - fee);
+            if (fee > 0) _transferETH(feeReceiver, fee);
         } else {
             require(msg.value == 0, "MKT: wrong eth value");
+            SafeERC20.safeTransferFrom(IERC20(order.payToken), msg.sender, order.seller, order.price - fee);
+            if (fee > 0) SafeERC20.safeTransferFrom(IERC20(order.payToken), msg.sender, feeReceiver, fee);
         }
-        _transferOut(order.payToken, order.seller, order.price - fee);
-        if (fee > 0) _transferOut(order.payToken, feeReceiver, fee);
 
         emit Sold(orderId, msg.sender, fee);
     }
 
-    function _transferOut(address token, address to, uint256 amount) private {
-        if (token == ETH_FLAG) {
-            // eth
-            (bool success,) = to.call{value: amount}("");
-            require(success, "MKT: transfer failed");
-        } else {
-            SafeERC20.safeTransferFrom(IERC20(token), msg.sender, to, amount);
-        }
+    function cancel(SellOrder calldata order, bytes calldata signature) external {
+        bytes32 orderId = _hashOrder(order);
+
+        // Verify the signature
+        address signer = ECDSA.recover(_hashTypedDataV4(orderId), signature);
+        require(signer == order.seller, "MKT: invalid signature");
+
+        // Only the seller can cancel their own order
+        require(signer == msg.sender, "MKT: not the seller");
+
+        // Mark the order as cancelled
+        cancelledOrders[orderId] = true;
+
+        emit Cancel(orderId);
     }
 
     bytes32 constant WL_TYPEHASH = keccak256("IsWhiteList(address user)");
-
     function _checkWL(bytes calldata signature) private view {
-        // check whiteListSigner for buyer
         bytes32 wlHash = _hashTypedDataV4(keccak256(abi.encode(WL_TYPEHASH, msg.sender)));
         address signer = ECDSA.recover(wlHash, signature);
         require(signer == whiteListSigner, "MKT: not whiteListSigner");
     }
 
+    function _hashOrder(SellOrder calldata order) private pure returns (bytes32) {
+        return keccak256(abi.encode(LIST_TYPEHASH, order.seller, order.nft, order.tokenId, order.payToken, order.price, order.deadline));
+    }
+
+    function _transferETH(address to, uint256 amount) private {
+        (bool success, ) = to.call{value: amount}("");
+        require(success, "MKT: transfer failed");
+    }
+
+    function getListTypeHash() external pure returns (bytes32) {
+        return LIST_TYPEHASH;
+    }
+
     // admin functions
     function setWhiteListSigner(address signer) external onlyOwner {
         require(signer != address(0), "MKT: zero address");
-        require(whiteListSigner != signer, "MKT:repeat set");
+        require(whiteListSigner != signer, "MKT: repeat set");
         whiteListSigner = signer;
 
         emit SetWhiteListSigner(signer);
     }
 
     function setFeeTo(address to) external onlyOwner {
-        require(feeTo != to, "MKT:repeat set");
+        require(feeTo != to, "MKT: repeat set");
         feeTo = to;
 
         emit SetFeeTo(to);
     }
 
-    event List(
-        address indexed nft,
-        uint256 indexed tokenId,
-        bytes32 orderId,
-        address seller,
-        address payToken,
-        uint256 price,
-        uint256 deadline
-    );
-    event Cancel(bytes32 orderId);
     event Sold(bytes32 orderId, address buyer, uint256 fee);
+    event Cancel(bytes32 orderId);
     event SetFeeTo(address to);
     event SetWhiteListSigner(address signer);
 }
